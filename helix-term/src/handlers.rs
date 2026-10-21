@@ -22,6 +22,7 @@ pub mod diagnostics;
 mod document_colors;
 mod document_highlight;
 mod document_links;
+pub mod interactive_refactor;
 mod prompt;
 mod signature_help;
 mod snippet;

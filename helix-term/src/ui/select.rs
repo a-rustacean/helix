@@ -40,6 +40,12 @@ impl<T: Item> Select<T> {
             options: menu,
         }
     }
+
+    /// Selects the option at `index` instead of the first option.
+    pub fn with_selection(mut self, index: usize) -> Self {
+        self.options.select(index);
+        self
+    }
 }
 
 impl<T: Item> Component for Select<T> {

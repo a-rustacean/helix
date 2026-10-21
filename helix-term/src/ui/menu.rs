@@ -201,6 +201,14 @@ impl<T: Item> Menu<T> {
         })
     }
 
+    /// Selects the option at `index` in the unfiltered option list, if it is currently matched.
+    pub fn select(&mut self, index: usize) {
+        if let Some(position) = self.matches.iter().position(|(i, _)| *i as usize == index) {
+            self.cursor = Some(position);
+            self.adjust_scroll();
+        }
+    }
+
     pub fn selection_mut(&mut self) -> Option<&mut T> {
         self.cursor.and_then(|cursor| {
             self.matches
