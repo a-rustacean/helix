@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::path::Path;
 
-use helix_lsp::{lsp, LanguageServerId};
+use helix_lsp::{jsonrpc, lsp, LanguageServerId};
 use helix_stdx::Url;
 use helix_view::Editor;
 use serde_json::Value;
@@ -45,7 +45,7 @@ fn resolve(
     // `formFields` is only defined for server responses, never requests.
     params.interactive.form_fields = None;
 
-    let Some(future) = language_server.resolve_command(params) else {
+    let Some(future) = language_server.resolve_command(params.clone()) else {
         editor.set_error("Language server does not support interactive command resolution");
         return;
     };
@@ -54,9 +54,31 @@ fn resolve(
         let result = future.await;
         dispatch_blocking(move |editor, compositor| match result {
             Ok(params) => handle_response(server_id, params, editor, compositor),
+            // A server may advertise command/resolve but still reject individual commands, for
+            // example when a proxy strips the method. Execute the command as if the server had
+            // not offered interactivity instead of failing the action outright.
+            Err(err) if is_method_not_found(&err) => {
+                log::debug!(
+                    "command/resolve is not supported for this command, executing it directly"
+                );
+                let command = lsp::Command {
+                    title: String::new(),
+                    command: params.command,
+                    arguments: Some(params.arguments),
+                };
+                editor.execute_lsp_command(command, server_id);
+            }
             Err(err) => editor.set_error(format!("Failed to resolve command: {err}")),
         });
     });
+}
+
+/// Whether the error is the JSON-RPC `Method not found` (-32601) error.
+fn is_method_not_found(error: &helix_lsp::Error) -> bool {
+    matches!(
+        error,
+        helix_lsp::Error::Rpc(error) if error.code == jsonrpc::ErrorCode::MethodNotFound
+    )
 }
 
 /// Handles a response from `command/resolve`, either by asking the remaining questions or by
@@ -607,6 +629,23 @@ mod tests {
         let new = dir.path().join("new.go");
         let answer = text_answer(new.to_str().unwrap(), &field).unwrap();
         assert!(answer.as_str().unwrap().starts_with("file://"));
+    }
+
+    #[test]
+    fn detects_method_not_found() {
+        let not_found = helix_lsp::Error::Rpc(jsonrpc::Error {
+            code: jsonrpc::ErrorCode::MethodNotFound,
+            message: String::new(),
+            data: None,
+        });
+        assert!(is_method_not_found(&not_found));
+
+        let other = helix_lsp::Error::Rpc(jsonrpc::Error {
+            code: jsonrpc::ErrorCode::InternalError,
+            message: String::new(),
+            data: None,
+        });
+        assert!(!is_method_not_found(&other));
     }
 
     #[test]
