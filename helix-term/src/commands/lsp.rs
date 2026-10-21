@@ -20,7 +20,7 @@ use helix_core::{
 use helix_stdx::path;
 use helix_view::{
     action::Action as CodeActionItem,
-    document::{DocumentInlayHints, DocumentInlayHintsId},
+    document::{DocumentInlayHints, DocumentInlayHintsId, Mode},
     editor::Action,
     handlers::lsp::SignatureHelpInvoked,
     theme::Style,
@@ -595,10 +595,27 @@ impl ui::menu::Item for CodeActionItem {
     }
 }
 
+fn code_action_range(
+    mode: Mode,
+    range: helix_core::Range,
+    text: helix_core::RopeSlice,
+) -> helix_core::Range {
+    // Helix represents the normal-mode cursor as a one-character block. Send it as a point so
+    // servers can tell a cursor apart from a selection: for example gopls expands a cursor to the
+    // enclosing struct for tag actions, but treats a range as an exact selection.
+    if mode == Mode::Normal && range.is_single_grapheme(text) {
+        helix_core::Range::point(range.cursor(text))
+    } else {
+        range
+    }
+}
+
 pub fn code_action(cx: &mut Context) {
+    let mode = cx.editor.mode;
     let (view, doc) = current!(cx.editor);
 
-    let selection_range = doc.selection(view.id).primary();
+    let selection_range =
+        code_action_range(mode, doc.selection(view.id).primary(), doc.text().slice(..));
 
     let mut futures: FuturesUnordered<_> =
         code_actions_for_range(doc, selection_range, None, CodeActionTriggerKind::INVOKED)
@@ -1514,4 +1531,34 @@ fn compute_inlay_hints_for_view(
     );
 
     Some(callback)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use helix_core::{Range, Rope};
+
+    #[test]
+    fn normal_mode_cursor_is_sent_as_point() {
+        let text = Rope::from("abc");
+        let cursor = Range::new(1, 2);
+        assert_eq!(
+            code_action_range(Mode::Normal, cursor, text.slice(..)),
+            Range::point(1)
+        );
+    }
+
+    #[test]
+    fn selections_are_sent_unchanged() {
+        let text = Rope::from("abc");
+        let selection = Range::new(0, 3);
+        assert_eq!(
+            code_action_range(Mode::Select, selection, text.slice(..)),
+            selection
+        );
+        assert_eq!(
+            code_action_range(Mode::Normal, selection, text.slice(..)),
+            selection
+        );
+    }
 }
