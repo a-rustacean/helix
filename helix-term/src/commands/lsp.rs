@@ -19,7 +19,6 @@ use helix_core::{
 };
 use helix_stdx::path;
 use helix_view::{
-    action::Action as CodeActionItem,
     document::{DocumentInlayHints, DocumentInlayHintsId, Mode},
     editor::Action,
     handlers::lsp::SignatureHelpInvoked,
@@ -588,10 +587,68 @@ pub fn workspace_diagnostics_picker(cx: &mut Context) {
     cx.push_layer(Box::new(overlaid(picker)));
 }
 
+enum CodeActionItem {
+    Lsp(helix_view::action::Action),
+    Interactive {
+        title: String,
+        priority: u8,
+        server_id: LanguageServerId,
+        command: lsp::Command,
+    },
+}
+
+impl CodeActionItem {
+    fn from_lsp(
+        server_id: LanguageServerId,
+        action: CodeActionOrCommand,
+        interactive: bool,
+    ) -> Self {
+        if interactive {
+            if let Some(command) = interactive_command(&action) {
+                let title = match &action {
+                    CodeActionOrCommand::Command(command) => command.title.clone(),
+                    CodeActionOrCommand::CodeAction(action) => action.title.clone(),
+                };
+                let priority = helix_view::action::lsp_code_action_priority(&action);
+                return Self::Interactive {
+                    title,
+                    priority,
+                    server_id,
+                    command,
+                };
+            }
+        }
+
+        Self::Lsp(helix_view::action::Action::lsp(server_id, action))
+    }
+
+    fn priority(&self) -> u8 {
+        match self {
+            Self::Lsp(action) => action.priority,
+            Self::Interactive { priority, .. } => *priority,
+        }
+    }
+}
+
+fn interactive_command(action: &CodeActionOrCommand) -> Option<lsp::Command> {
+    match action {
+        CodeActionOrCommand::Command(command) => Some(command.clone()),
+        CodeActionOrCommand::CodeAction(CodeAction {
+            edit: None,
+            command: Some(command),
+            ..
+        }) => Some(command.clone()),
+        _ => None,
+    }
+}
+
 impl ui::menu::Item for CodeActionItem {
     type Data = ();
     fn format(&self, _data: &Self::Data) -> Row<'_> {
-        self.title().into()
+        match self {
+            Self::Lsp(action) => action.title().into(),
+            Self::Interactive { title, .. } => title.as_str().into(),
+        }
     }
 }
 
@@ -617,27 +674,39 @@ pub fn code_action(cx: &mut Context) {
     let selection_range =
         code_action_range(mode, doc.selection(view.id).primary(), doc.text().slice(..));
 
+    let interactive_servers: HashSet<_> = doc
+        .language_servers_with_feature(LanguageServerFeature::CodeAction)
+        .filter(|language_server| language_server.supports_command_resolve())
+        .map(|language_server| language_server.id())
+        .collect();
+
     let mut futures: FuturesUnordered<_> =
         code_actions_for_range(doc, selection_range, None, CodeActionTriggerKind::INVOKED)
             .into_iter()
-            .map(|(request, ls_id)| async move {
-                let Some(mut actions) = request.await? else {
-                    return anyhow::Ok(Vec::new());
-                };
+            .map(move |(request, ls_id)| {
+                let interactive = interactive_servers.contains(&ls_id);
+                async move {
+                    let Some(mut actions) = request.await? else {
+                        return anyhow::Ok(Vec::new());
+                    };
 
-                // remove disabled code actions
-                actions.retain(|action| {
-                    matches!(
-                        action,
-                        CodeActionOrCommand::Command(_)
-                            | CodeActionOrCommand::CodeAction(CodeAction { disabled: None, .. })
-                    )
-                });
+                    // remove disabled code actions
+                    actions.retain(|action| {
+                        matches!(
+                            action,
+                            CodeActionOrCommand::Command(_)
+                                | CodeActionOrCommand::CodeAction(CodeAction {
+                                    disabled: None,
+                                    ..
+                                })
+                        )
+                    });
 
-                Ok(actions
-                    .into_iter()
-                    .map(|lsp_item| CodeActionItem::lsp(ls_id, lsp_item))
-                    .collect())
+                    Ok(actions
+                        .into_iter()
+                        .map(|lsp_item| CodeActionItem::from_lsp(ls_id, lsp_item, interactive))
+                        .collect())
+                }
             })
             .collect();
 
@@ -659,7 +728,7 @@ pub fn code_action(cx: &mut Context) {
 
         // Sort the gathered actions into a useful order, highest priority first. See
         // `lsp_code_action_priority` for how LSP actions are ranked.
-        actions.sort_by_key(|action| std::cmp::Reverse(action.priority));
+        actions.sort_by_key(|action| std::cmp::Reverse(action.priority()));
 
         let call = move |editor: &mut Editor, compositor: &mut Compositor| {
             if actions.is_empty() {
@@ -671,7 +740,20 @@ pub fn code_action(cx: &mut Context) {
                     return;
                 }
                 // Always present on validate.
-                action.unwrap().execute(editor);
+                match action.unwrap() {
+                    CodeActionItem::Lsp(action) => action.execute(editor),
+                    CodeActionItem::Interactive {
+                        server_id, command, ..
+                    } => {
+                        let server_id = *server_id;
+                        let command = command.clone();
+                        crate::job::dispatch_blocking(move |editor, _compositor| {
+                            crate::handlers::interactive_refactor::start(
+                                server_id, command, editor,
+                            );
+                        });
+                    }
+                }
             });
             picker.move_down(); // pre-select the first item
 
