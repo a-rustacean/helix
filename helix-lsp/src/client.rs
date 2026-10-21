@@ -569,6 +569,8 @@ impl Client {
     // General messages
     // -------------------------------------------------------------------------------------------
 
+    // `..Default::default()` is required when the `proposed` feature adds fields.
+    #[allow(clippy::needless_update)]
     pub(crate) async fn initialize(&self, enable_snippets: bool) -> Result<lsp::InitializeResult> {
         if let Some(config) = &self.config {
             log::info!("Using custom LSP config: {}", config);
@@ -630,6 +632,9 @@ impl Client {
                     }),
                     diagnostic: Some(lsp::DiagnosticWorkspaceClientCapabilities {
                         refresh_support: Some(true),
+                    }),
+                    interactive_resolve: Some(lsp::InteractiveResolveClientCapabilities {
+                        input_types: Some(lsp::FormFieldKind::SUPPORTED.to_vec()),
                     }),
                     ..Default::default()
                 }),
@@ -761,6 +766,11 @@ impl Client {
                     ]),
                     ..Default::default()
                 }),
+                experimental: Some(serde_json::json!({
+                    "interactiveResolve": {
+                        "inputTypes": ["string", "file", "bool", "number", "enum"],
+                    },
+                })),
                 ..Default::default()
             },
             trace: None,
@@ -1211,6 +1221,41 @@ impl Client {
         }
 
         Some(self.call_with_ref::<lsp::request::CodeActionResolveRequest>(code_action))
+    }
+
+    /// Whether the server supports interactive resolution of commands through the
+    /// `command/resolve` request.
+    pub fn supports_command_resolve(&self) -> bool {
+        command_resolve_supported(self.capabilities())
+    }
+
+    /// Resolves the parameters of a command interactively. The returned parameters may contain
+    /// form fields that the user must answer. Repeat the request with the answers until the
+    /// server responds without form fields, then call [`Self::execute_command`].
+    pub fn resolve_command(
+        &self,
+        mut params: lsp::ExecuteCommandParams,
+    ) -> Option<impl Future<Output = Result<lsp::ExecuteCommandParams>>> {
+        if !self.supports_command_resolve() {
+            return None;
+        }
+
+        // `formFields` is server-to-client only.
+        params.interactive.form_fields = None;
+        Some(self.call::<lsp::request::CommandResolve>(params))
+    }
+
+    /// Executes a command with fully resolved parameters.
+    pub fn execute_command(
+        &self,
+        params: lsp::ExecuteCommandParams,
+    ) -> Option<impl Future<Output = Result<Option<Value>>>> {
+        let capabilities = self.capabilities.get().unwrap();
+
+        // Return early if the language server does not support executing commands.
+        capabilities.execute_command_provider.as_ref()?;
+
+        Some(self.call::<lsp::request::ExecuteCommand>(params))
     }
 
     pub fn text_document_signature_help(
@@ -1792,25 +1837,78 @@ impl Client {
         &self,
         command: lsp::Command,
     ) -> Option<impl Future<Output = Result<Option<Value>>>> {
-        let capabilities = self.capabilities.get().unwrap();
-
-        // Return early if the language server does not support executing commands.
-        capabilities.execute_command_provider.as_ref()?;
-
         let params = lsp::ExecuteCommandParams {
             command: command.command,
             arguments: command.arguments.unwrap_or_default(),
             work_done_progress_params: lsp::WorkDoneProgressParams {
                 work_done_token: None,
             },
+            interactive: lsp::InteractiveParams::default(),
         };
 
-        Some(self.call::<lsp::request::ExecuteCommand>(params))
+        self.execute_command(params)
     }
 
     pub fn did_change_watched_files(&self, changes: Vec<lsp::FileEvent>) {
         self.notify::<lsp::notification::DidChangeWatchedFiles>(lsp::DidChangeWatchedFilesParams {
             changes,
         })
+    }
+}
+
+fn command_resolve_supported(capabilities: &lsp::ServerCapabilities) -> bool {
+    let supports_kind = |kinds: &[String]| kinds.iter().any(|kind| kind == "command");
+
+    let supports_formal = capabilities
+        .interactive_resolve_provider
+        .as_ref()
+        .and_then(|options| options.kinds.as_deref())
+        .is_some_and(supports_kind);
+
+    let supports_experimental = capabilities
+        .experimental
+        .as_ref()
+        .and_then(|experimental| experimental.get("interactiveResolveProvider"))
+        .is_some_and(|provider| {
+            // The prototype originally advertised the kinds as an array directly and later
+            // moved them into a `kinds` field. Accept both shapes.
+            let kinds = provider.get("kinds").unwrap_or(provider);
+            kinds
+                .as_array()
+                .is_some_and(|kinds| kinds.iter().any(|kind| kind.as_str() == Some("command")))
+        });
+
+    supports_formal || supports_experimental
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn capabilities(value: Value) -> lsp::ServerCapabilities {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn detects_command_resolve_capability() {
+        assert!(!command_resolve_supported(&capabilities(json!({}))));
+
+        assert!(command_resolve_supported(&capabilities(json!({
+            "interactiveResolveProvider": { "kinds": ["command"] },
+        }))));
+        assert!(!command_resolve_supported(&capabilities(json!({
+            "interactiveResolveProvider": { "kinds": ["other"] },
+        }))));
+
+        assert!(command_resolve_supported(&capabilities(json!({
+            "experimental": { "interactiveResolveProvider": { "kinds": ["command"] } },
+        }))));
+        assert!(command_resolve_supported(&capabilities(json!({
+            "experimental": { "interactiveResolveProvider": ["command"] },
+        }))));
+        assert!(!command_resolve_supported(&capabilities(json!({
+            "experimental": { "interactiveResolveProvider": ["other"] },
+        }))));
     }
 }
