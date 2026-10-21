@@ -99,7 +99,7 @@ impl Action {
 /// This roughly matches VSCode's ordering: code actions are sorted first by the category declared
 /// on the `kind` field, then by whether they fix a diagnostic, then by whether they are marked
 /// preferred. See <https://github.com/microsoft/vscode/blob/eaec601dd69aeb4abb63b9601a6f44308c8d8c6e/src/vs/editor/contrib/codeAction/browser/codeActionWidget.ts>.
-fn lsp_code_action_priority(action: &lsp::CodeActionOrCommand) -> u8 {
+pub fn lsp_code_action_priority(action: &lsp::CodeActionOrCommand) -> u8 {
     // The `kind` field is open ended in the LSP spec, but in practice a closed set of common values
     // (mostly suggested by the spec) is used. VSCode shows these as menu headers; we don't, but we
     // sort by them the same way.
