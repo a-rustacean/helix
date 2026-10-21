@@ -153,6 +153,9 @@ pub use inlay_hint::*;
 mod inline_value;
 pub use inline_value::*;
 
+mod interactive;
+pub use interactive::*;
+
 #[cfg(feature = "proposed")]
 mod inline_completion;
 #[cfg(feature = "proposed")]
@@ -1369,6 +1372,10 @@ pub struct WorkspaceClientCapabilities {
     /// since 3.17.0
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<DiagnosticWorkspaceClientCapabilities>,
+
+    /// Client workspace capabilities specific to interactive resolution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interactive_resolve: Option<InteractiveResolveClientCapabilities>,
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Default, Deserialize, Serialize)]
@@ -2069,6 +2076,10 @@ pub struct ServerCapabilities {
     #[cfg(feature = "proposed")]
     pub inline_completion_provider: Option<OneOf<bool, InlineCompletionOptions>>,
 
+    /// The server provides interactive resolution support.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interactive_resolve_provider: Option<InteractiveResolveOptions>,
+
     /// Experimental server capabilities.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub experimental: Option<Value>,
@@ -2653,6 +2664,10 @@ pub struct ExecuteCommandParams {
 
     #[serde(flatten)]
     pub work_done_progress_params: WorkDoneProgressParams,
+
+    /// Interactive resolution state for the `command/resolve` request.
+    #[serde(flatten)]
+    pub interactive: InteractiveParams,
 }
 
 /// Execute command registration options.

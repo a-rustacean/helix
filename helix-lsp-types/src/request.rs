@@ -447,6 +447,19 @@ impl Request for ExecuteCommand {
     const METHOD: &'static str = "workspace/executeCommand";
 }
 
+/// The command/resolve request is sent from the client to the server to resolve the parameters of
+/// a command before it is executed. The server may respond with form fields that the client must
+/// present to the user. The request is repeated with the user's answers until the server omits the
+/// form fields, at which point the command can be executed.
+#[derive(Debug)]
+pub enum CommandResolve {}
+
+impl Request for CommandResolve {
+    type Params = ExecuteCommandParams;
+    type Result = ExecuteCommandParams;
+    const METHOD: &'static str = "command/resolve";
+}
+
 /// The document will save request is sent from the client to the server before the document is
 /// actually saved. The request can return an array of TextEdits which will be applied to the text
 /// document before it is saved. Please note that clients might drop results if computing the text
