@@ -30,6 +30,14 @@ keys are listed below.
 | Format document | `:format`, or set `auto-format` to format on save |
 | Inlay hints | enable with `display-inlay-hints` (see below) |
 
+## Interactive code actions
+
+Some servers (for example `gopls`) offer refactorings that need additional input,
+such as a target file or a set of struct tags. When such an action is selected
+from the code action menu (`Space-a`), Helix prompts for the remaining values one
+at a time and then executes the command. Press `Esc` to cancel. If the server
+rejects an answer, the field is shown again with the server's error message.
+
 ## Configuration
 
 The [`[editor.lsp]`](./editor.md#editorlsp-section) section of `config.toml`
