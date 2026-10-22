@@ -766,9 +766,14 @@ impl Client {
                     ]),
                     ..Default::default()
                 }),
+                // TODO: Drop the experimental advertisement once the interactive refactoring
+                // proposal is accepted; servers should read `workspace.interactiveResolve`
+                // instead. The input list is derived from `SUPPORTED` so both capability
+                // advertisements cannot drift apart.
                 experimental: Some(serde_json::json!({
                     "interactiveResolve": {
-                        "inputTypes": ["string", "file", "bool", "number", "enum"],
+                        "inputTypes": serde_json::to_value(lsp::FormFieldKind::SUPPORTED)
+                            .expect("FormFieldKind serializes into a JSON array"),
                     },
                 })),
                 ..Default::default()
@@ -1865,6 +1870,8 @@ fn command_resolve_supported(capabilities: &lsp::ServerCapabilities) -> bool {
         .and_then(|options| options.kinds.as_deref())
         .is_some_and(supports_kind);
 
+    // TODO: Accept only the formal capability once the interactive refactoring proposal is
+    // accepted; the experimental shapes exist to talk to current prototype servers.
     let supports_experimental = capabilities
         .experimental
         .as_ref()
