@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use helix_lsp::{jsonrpc, lsp, LanguageServerId};
 use helix_stdx::Url;
@@ -11,12 +12,25 @@ use crate::compositor::Compositor;
 use crate::job::dispatch_blocking;
 use crate::ui::{self, menu, PromptEvent};
 
+/// Identifies the most recently started flow. Responses for superseded flows are dropped so a
+/// slow resolve cannot surface prompts after the user has moved on or started another flow.
+static CURRENT_FLOW: AtomicU64 = AtomicU64::new(0);
+
+/// Maximum number of prompting rounds before giving up on a server that never stops asking.
+const MAX_RESOLVE_ROUNDS: usize = 10;
+
+fn is_current(flow: u64) -> bool {
+    CURRENT_FLOW.load(Ordering::Relaxed) == flow
+}
+
 /// Starts the interactive resolution flow for a command.
 ///
 /// The command is first sent to `command/resolve`. If the server responds with form fields, the
 /// user is prompted for answers one field at a time and the command params are re-resolved until
 /// the server returns no more fields. The command is then executed via `workspace/executeCommand`.
 pub fn start(server_id: LanguageServerId, command: lsp::Command, editor: &mut Editor) {
+    let flow = CURRENT_FLOW.fetch_add(1, Ordering::Relaxed) + 1;
+
     let params = lsp::ExecuteCommandParams {
         command: command.command,
         arguments: command.arguments.unwrap_or_default(),
@@ -24,7 +38,8 @@ pub fn start(server_id: LanguageServerId, command: lsp::Command, editor: &mut Ed
         interactive: Default::default(),
     };
 
-    resolve(server_id, params, editor);
+    // `rounds` counts the resolve round trips; the first one is in flight as of this call.
+    resolve(server_id, params, flow, 1, editor);
 }
 
 /// Sends the current params to `command/resolve` and continues the flow with the response.
@@ -35,6 +50,8 @@ pub fn start(server_id: LanguageServerId, command: lsp::Command, editor: &mut Ed
 fn resolve(
     server_id: LanguageServerId,
     mut params: lsp::ExecuteCommandParams,
+    flow: u64,
+    rounds: usize,
     editor: &mut Editor,
 ) {
     let Some(language_server) = editor.language_server_by_id(server_id) else {
@@ -52,23 +69,30 @@ fn resolve(
 
     tokio::spawn(async move {
         let result = future.await;
-        dispatch_blocking(move |editor, compositor| match result {
-            Ok(params) => handle_response(server_id, params, editor, compositor),
-            // A server may advertise command/resolve but still reject individual commands, for
-            // example when a proxy strips the method. Execute the command as if the server had
-            // not offered interactivity instead of failing the action outright.
-            Err(err) if is_method_not_found(&err) => {
-                log::debug!(
-                    "command/resolve is not supported for this command, executing it directly"
-                );
-                let command = lsp::Command {
-                    title: String::new(),
-                    command: params.command,
-                    arguments: Some(params.arguments),
-                };
-                editor.execute_lsp_command(command, server_id);
+        dispatch_blocking(move |editor, compositor| {
+            if !is_current(flow) {
+                log::debug!("dropping response for a superseded interactive resolve flow");
+                return;
             }
-            Err(err) => editor.set_error(format!("Failed to resolve command: {err}")),
+
+            match result {
+                Ok(params) => handle_response(server_id, params, flow, rounds, editor, compositor),
+                // A server may advertise command/resolve but still reject individual commands,
+                // for example when a proxy strips the method. Execute the command as if the
+                // server had not offered interactivity instead of failing the action outright.
+                Err(err) if is_method_not_found(&err) => {
+                    log::debug!(
+                        "command/resolve is not supported for this command, executing it directly"
+                    );
+                    let command = lsp::Command {
+                        title: String::new(),
+                        command: params.command,
+                        arguments: Some(params.arguments),
+                    };
+                    editor.execute_lsp_command(command, server_id);
+                }
+                Err(err) => editor.set_error(format!("Failed to resolve command: {err}")),
+            }
         });
     });
 }
@@ -86,6 +110,8 @@ fn is_method_not_found(error: &helix_lsp::Error) -> bool {
 fn handle_response(
     server_id: LanguageServerId,
     mut params: lsp::ExecuteCommandParams,
+    flow: u64,
+    rounds: usize,
     editor: &mut Editor,
     compositor: &mut Compositor,
 ) {
@@ -99,6 +125,15 @@ fn handle_response(
         execute(server_id, params, editor);
         return;
     };
+
+    // Guard against a server that returns questions forever instead of converging; without a
+    // limit the user would be stuck in an unbounded loop of prompts.
+    if rounds > MAX_RESOLVE_ROUNDS {
+        editor.set_error(format!(
+            "The language server keeps requesting input; giving up after {MAX_RESOLVE_ROUNDS} rounds"
+        ));
+        return;
+    }
 
     // Answers for fields that the server no longer asks about must not be sent back.
     if let Some(answers) = &mut params.interactive.form_answers {
@@ -118,7 +153,7 @@ fn handle_response(
         pending = fields.into();
     }
 
-    ask_next(server_id, params, pending, editor, compositor);
+    ask_next(server_id, params, flow, rounds, pending, editor, compositor);
 }
 
 /// Whether a field should be presented to the user. Answered fields are skipped unless the
@@ -142,12 +177,14 @@ fn needs_answer(field: &lsp::FormField, params: &lsp::ExecuteCommandParams) -> b
 fn ask_next(
     server_id: LanguageServerId,
     params: lsp::ExecuteCommandParams,
+    flow: u64,
+    rounds: usize,
     mut pending: VecDeque<lsp::FormField>,
     editor: &mut Editor,
     compositor: &mut Compositor,
 ) {
     let Some(field) = pending.pop_front() else {
-        resolve(server_id, params, editor);
+        resolve(server_id, params, flow, rounds + 1, editor);
         return;
     };
 
@@ -159,6 +196,8 @@ fn ask_next(
         lsp::FormFieldType::String => ask_text(
             server_id,
             params,
+            flow,
+            rounds,
             pending,
             field,
             ui::completers::none,
@@ -168,28 +207,32 @@ fn ask_next(
         lsp::FormFieldType::File { .. } => {
             let completer = file_completer(&field);
             ask_text(
-                server_id, params, pending, field, completer, editor, compositor,
+                server_id, params, flow, rounds, pending, field, completer, editor, compositor,
             )
         }
         lsp::FormFieldType::Number => ask_text(
             server_id,
             params,
+            flow,
+            rounds,
             pending,
             field,
             ui::completers::none,
             editor,
             compositor,
         ),
-        lsp::FormFieldType::Bool => ask_bool(server_id, params, pending, field, compositor),
+        lsp::FormFieldType::Bool => {
+            ask_bool(server_id, params, flow, rounds, pending, field, compositor)
+        }
         lsp::FormFieldType::Enum { entries, .. } if entries.is_empty() => {
             editor.set_error(format!(
                 "Language server sent no options for \"{}\"",
                 field.description
             ));
         }
-        lsp::FormFieldType::Enum { entries, .. } => {
-            ask_enum(server_id, params, pending, field, &entries, compositor)
-        }
+        lsp::FormFieldType::Enum { entries, .. } => ask_enum(
+            server_id, params, flow, rounds, pending, field, &entries, compositor,
+        ),
         lsp::FormFieldType::LazyEnum { .. } | lsp::FormFieldType::List { .. } => {
             editor.set_error(format!(
                 "Unsupported form field type for \"{}\"",
@@ -202,6 +245,8 @@ fn ask_next(
 fn ask_text(
     server_id: LanguageServerId,
     params: lsp::ExecuteCommandParams,
+    flow: u64,
+    rounds: usize,
     pending: VecDeque<lsp::FormField>,
     field: lsp::FormField,
     completer: ui::completers::Completer,
@@ -225,16 +270,22 @@ fn ask_text(
             }
 
             match text_answer(input, &field) {
-                Ok(value) => {
-                    answer_and_continue(server_id, params.clone(), pending.clone(), &field, value)
-                }
+                Ok(value) => answer_and_continue(
+                    server_id,
+                    params.clone(),
+                    flow,
+                    rounds,
+                    pending.clone(),
+                    &field,
+                    value,
+                ),
                 Err(err) => {
                     let params = params.clone();
                     let mut pending = pending.clone();
                     pending.push_front(field.clone());
                     dispatch_blocking(move |editor, compositor| {
                         editor.set_error(err);
-                        ask_next(server_id, params, pending, editor, compositor);
+                        ask_next(server_id, params, flow, rounds, pending, editor, compositor);
                     });
                 }
             }
@@ -248,6 +299,8 @@ fn ask_text(
 fn ask_bool(
     server_id: LanguageServerId,
     params: lsp::ExecuteCommandParams,
+    flow: u64,
+    rounds: usize,
     pending: VecDeque<lsp::FormField>,
     field: lsp::FormField,
     compositor: &mut Compositor,
@@ -266,6 +319,8 @@ fn ask_bool(
             answer_and_continue(
                 server_id,
                 params.clone(),
+                flow,
+                rounds,
                 pending.clone(),
                 &field,
                 Value::Bool(choice.0),
@@ -280,6 +335,8 @@ fn ask_bool(
 fn ask_enum(
     server_id: LanguageServerId,
     params: lsp::ExecuteCommandParams,
+    flow: u64,
+    rounds: usize,
     pending: VecDeque<lsp::FormField>,
     field: lsp::FormField,
     entries: &[lsp::FormEnumEntry],
@@ -309,6 +366,8 @@ fn ask_enum(
             answer_and_continue(
                 server_id,
                 params.clone(),
+                flow,
+                rounds,
                 pending.clone(),
                 &field,
                 Value::String(choice.value.clone()),
@@ -325,6 +384,8 @@ fn ask_enum(
 fn answer_and_continue(
     server_id: LanguageServerId,
     mut params: lsp::ExecuteCommandParams,
+    flow: u64,
+    rounds: usize,
     pending: VecDeque<lsp::FormField>,
     field: &lsp::FormField,
     value: Value,
@@ -332,7 +393,7 @@ fn answer_and_continue(
     set_answer(&mut params, &field.id, value);
 
     dispatch_blocking(move |editor, compositor| {
-        ask_next(server_id, params, pending, editor, compositor);
+        ask_next(server_id, params, flow, rounds, pending, editor, compositor);
     });
 }
 
