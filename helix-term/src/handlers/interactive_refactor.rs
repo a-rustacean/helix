@@ -194,32 +194,13 @@ fn ask_next(
 
     match field.field_type.clone() {
         lsp::FormFieldType::String => ask_text(
-            server_id,
-            params,
-            flow,
-            rounds,
-            pending,
-            field,
-            ui::completers::none,
-            editor,
-            compositor,
+            server_id, params, flow, rounds, pending, field, None, editor, compositor,
         ),
-        lsp::FormFieldType::File { .. } => {
-            let completer = file_completer(&field);
-            ask_text(
-                server_id, params, flow, rounds, pending, field, completer, editor, compositor,
-            )
-        }
+        lsp::FormFieldType::File { .. } => ask_text(
+            server_id, params, flow, rounds, pending, field, None, editor, compositor,
+        ),
         lsp::FormFieldType::Number => ask_text(
-            server_id,
-            params,
-            flow,
-            rounds,
-            pending,
-            field,
-            ui::completers::none,
-            editor,
-            compositor,
+            server_id, params, flow, rounds, pending, field, None, editor, compositor,
         ),
         lsp::FormFieldType::Bool => {
             ask_bool(server_id, params, flow, rounds, pending, field, compositor)
@@ -242,6 +223,7 @@ fn ask_next(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ask_text(
     server_id: LanguageServerId,
     params: lsp::ExecuteCommandParams,
@@ -249,15 +231,21 @@ fn ask_text(
     rounds: usize,
     pending: VecDeque<lsp::FormField>,
     field: lsp::FormField,
-    completer: ui::completers::Completer,
+    prefill: Option<String>,
     editor: &mut Editor,
     compositor: &mut Compositor,
 ) {
-    let prefill = match &field.field_type {
+    // A rejected answer is offered back for editing instead of being discarded.
+    let prefill = prefill.unwrap_or_else(|| match &field.field_type {
         lsp::FormFieldType::File { .. } => initial_value(&params, &field)
             .map(|value| file_input_value(&value))
             .unwrap_or_default(),
         _ => initial_value(&params, &field).unwrap_or_default(),
+    });
+
+    let completer = match &field.field_type {
+        lsp::FormFieldType::File { .. } => file_completer(&field),
+        _ => ui::completers::none,
     };
 
     let prompt = ui::Prompt::new(
@@ -281,11 +269,24 @@ fn ask_text(
                 ),
                 Err(err) => {
                     let params = params.clone();
-                    let mut pending = pending.clone();
-                    pending.push_front(field.clone());
+                    let pending = pending.clone();
+                    let field = field.clone();
+                    // Re-ask the same field with the input that was just rejected so the user
+                    // can correct it instead of retyping it.
+                    let prefill = input.to_string();
                     dispatch_blocking(move |editor, compositor| {
                         editor.set_error(err);
-                        ask_next(server_id, params, flow, rounds, pending, editor, compositor);
+                        ask_text(
+                            server_id,
+                            params,
+                            flow,
+                            rounds,
+                            pending,
+                            field,
+                            Some(prefill),
+                            editor,
+                            compositor,
+                        );
                     });
                 }
             }
@@ -332,6 +333,7 @@ fn ask_bool(
     compositor.push(Box::new(select));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ask_enum(
     server_id: LanguageServerId,
     params: lsp::ExecuteCommandParams,
