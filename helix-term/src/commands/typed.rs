@@ -1747,21 +1747,11 @@ fn lsp_workspace_command(
                         commands,
                         (),
                         move |cx, (ls_id, command), _action| {
-                            let ls_id = *ls_id;
-                            let command = command.clone();
-                            let interactive = cx.editor.language_server_by_id(ls_id).is_some_and(
-                                |language_server| language_server.supports_command_resolve(),
+                            crate::handlers::interactive_refactor::resolve_or_execute(
+                                *ls_id,
+                                command.clone(),
+                                cx.editor,
                             );
-
-                            if interactive {
-                                crate::job::dispatch_blocking(move |editor, _compositor| {
-                                    crate::handlers::interactive_refactor::start(
-                                        ls_id, command, editor,
-                                    );
-                                });
-                            } else {
-                                cx.editor.execute_lsp_command(command, ls_id);
-                            }
                         },
                     );
                     compositor.push(Box::new(overlaid(picker)))
@@ -1794,19 +1784,9 @@ fn lsp_workspace_command(
                     arguments,
                     command,
                 };
-                let interactive = cx
-                    .editor
-                    .language_server_by_id(*ls_id)
-                    .is_some_and(|language_server| language_server.supports_command_resolve());
-
-                if interactive {
-                    let ls_id = *ls_id;
-                    crate::job::dispatch_blocking(move |editor, _compositor| {
-                        crate::handlers::interactive_refactor::start(ls_id, command, editor);
-                    });
-                } else {
-                    cx.editor.execute_lsp_command(command, *ls_id);
-                }
+                crate::handlers::interactive_refactor::resolve_or_execute(
+                    *ls_id, command, cx.editor,
+                );
             }
             [] => {
                 cx.editor.set_status(format!(

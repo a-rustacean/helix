@@ -23,6 +23,20 @@ fn is_current(flow: u64) -> bool {
     CURRENT_FLOW.load(Ordering::Relaxed) == flow
 }
 
+/// Executes a command, routing it through interactive resolution when the server supports
+/// `command/resolve`, or directly through `workspace/executeCommand` otherwise.
+pub fn resolve_or_execute(server_id: LanguageServerId, command: lsp::Command, editor: &mut Editor) {
+    let interactive = editor
+        .language_server_by_id(server_id)
+        .is_some_and(|language_server| language_server.supports_command_resolve());
+
+    if interactive {
+        dispatch_blocking(move |editor, _compositor| start(server_id, command, editor));
+    } else {
+        editor.execute_lsp_command(command, server_id);
+    }
+}
+
 /// Starts the interactive resolution flow for a command.
 ///
 /// The command is first sent to `command/resolve`. If the server responds with form fields, the
